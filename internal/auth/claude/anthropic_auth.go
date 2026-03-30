@@ -50,8 +50,8 @@ type ClaudeAuth struct {
 }
 
 // NewClaudeAuth creates a new Anthropic authentication service.
-// It initializes the HTTP client with a custom TLS transport that uses Firefox
-// fingerprint to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
+// It initializes the HTTP client with a custom TLS transport that replicates
+// the exact TLS fingerprint of Claude Code CLI (OpenSSL 3.x / Python httpx).
 //
 // Parameters:
 //   - cfg: The application configuration containing proxy settings
@@ -59,8 +59,7 @@ type ClaudeAuth struct {
 // Returns:
 //   - *ClaudeAuth: A new Claude authentication service instance
 func NewClaudeAuth(cfg *config.Config) *ClaudeAuth {
-	// Use custom HTTP client with Firefox TLS fingerprint to bypass
-	// Cloudflare's bot detection on Anthropic domains
+	// Use custom HTTP client replicating Claude Code CLI TLS fingerprint
 	return &ClaudeAuth{
 		httpClient: NewAnthropicHttpClient(&cfg.SDKConfig),
 	}

@@ -1,5 +1,6 @@
 // Package claude provides authentication functionality for Anthropic's Claude API.
-// This file implements a custom HTTP transport using utls to bypass TLS fingerprinting.
+// This file implements a custom HTTP transport using utls to replicate the exact
+// TLS fingerprint of Claude Code CLI (OpenSSL 3.x / Python httpx).
 package claude
 
 import (
@@ -15,20 +16,16 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// utlsRoundTripper implements http.RoundTripper using utls with Chrome fingerprint
-// to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
+// utlsRoundTripper implements http.RoundTripper using utls to replicate the
+// exact TLS fingerprint of the Claude Code CLI (OpenSSL 3.x, 52 cipher suites,
+// no GREASE, ML-KEM-768 key share).
 type utlsRoundTripper struct {
-	// mu protects the connections map and pending map
-	mu sync.Mutex
-	// connections caches HTTP/2 client connections per host
+	mu          sync.Mutex
 	connections map[string]*http2.ClientConn
-	// pending tracks hosts that are currently being connected to (prevents race condition)
-	pending map[string]*sync.Cond
-	// dialer is used to create network connections, supporting proxies
-	dialer proxy.Dialer
+	pending     map[string]*sync.Cond
+	dialer      proxy.Dialer
 }
 
-// newUtlsRoundTripper creates a new utls-based round tripper with optional proxy support
 func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
 	if cfg != nil {
@@ -39,7 +36,6 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 			dialer = proxyDialer
 		}
 	}
-
 	return &utlsRoundTripper{
 		connections: make(map[string]*http2.ClientConn),
 		pending:     make(map[string]*sync.Cond),
@@ -47,57 +43,160 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	}
 }
 
-// getOrCreateConnection gets an existing connection or creates a new one.
-// It uses a per-host locking mechanism to prevent multiple goroutines from
-// creating connections to the same host simultaneously.
 func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
 	t.mu.Lock()
 
-	// Check if connection exists and is usable
 	if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
 		t.mu.Unlock()
 		return h2Conn, nil
 	}
 
-	// Check if another goroutine is already creating a connection
 	if cond, ok := t.pending[host]; ok {
-		// Wait for the other goroutine to finish
 		cond.Wait()
-		// Check if connection is now available
 		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
 			t.mu.Unlock()
 			return h2Conn, nil
 		}
-		// Connection still not available, we'll create one
 	}
 
-	// Mark this host as pending
 	cond := sync.NewCond(&t.mu)
 	t.pending[host] = cond
 	t.mu.Unlock()
 
-	// Create connection outside the lock
 	h2Conn, err := t.createConnection(host, addr)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
-	// Remove pending marker and wake up waiting goroutines
 	delete(t.pending, host)
 	cond.Broadcast()
 
 	if err != nil {
 		return nil, err
 	}
-
-	// Store the new connection
 	t.connections[host] = h2Conn
 	return h2Conn, nil
 }
 
-// createConnection creates a new HTTP/2 connection with Chrome TLS fingerprint.
-// Chrome's TLS fingerprint is closer to Node.js/OpenSSL (which real Claude Code uses)
-// than Firefox, reducing the mismatch between TLS layer and HTTP headers.
+// claudeCodeClientHelloSpec returns a ClientHelloSpec that exactly replicates
+// the TLS fingerprint of Claude Code CLI (Python httpx + OpenSSL 3.x).
+// Characteristics: 52 cipher suites, no GREASE, OpenSSL extension ordering,
+// ML-KEM-768 + X25519 dual key shares, 26 signature algorithms.
+func claudeCodeClientHelloSpec() tls.ClientHelloSpec {
+	return tls.ClientHelloSpec{
+		TLSVersMin: tls.VersionTLS12,
+		TLSVersMax: tls.VersionTLS13,
+		CipherSuites: []uint16{
+			// TLS 1.3 suites (1302 first — OpenSSL 3.x default ordering)
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+			tls.TLS_AES_128_GCM_SHA256,
+			// TLS 1.2 ECDHE/DHE suites
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			0x009e, // TLS_DHE_RSA_WITH_AES_128_GCM_SHA256
+			0xc027, // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
+			0x0067, // TLS_DHE_RSA_WITH_AES_128_CBC_SHA256
+			0xc028, // TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384
+			0x006b, // TLS_DHE_RSA_WITH_AES_256_CBC_SHA256
+			0x00a3, // TLS_DHE_DSS_WITH_AES_256_GCM_SHA384
+			0x009f, // TLS_DHE_RSA_WITH_AES_256_GCM_SHA384
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+			0xccaa, // TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+			0xc0ad, // TLS_ECDHE_ECDSA_WITH_AES_256_CCM
+			0xc09f, // TLS_DHE_RSA_WITH_AES_256_CCM
+			0xc05d, // TLS_ECDHE_ECDSA_WITH_ARIA_256_GCM_SHA384
+			0xc061, // TLS_ECDHE_RSA_WITH_ARIA_256_GCM_SHA384
+			0xc057, // TLS_DHE_DSS_WITH_ARIA_256_GCM_SHA384
+			0xc053, // TLS_DHE_RSA_WITH_ARIA_256_GCM_SHA384
+			0x00a2, // TLS_DHE_DSS_WITH_AES_128_GCM_SHA256
+			0xc0ac, // TLS_ECDHE_ECDSA_WITH_AES_128_CCM
+			0xc09e, // TLS_DHE_RSA_WITH_AES_128_CCM
+			0xc05c, // TLS_ECDHE_ECDSA_WITH_ARIA_128_GCM_SHA256
+			0xc060, // TLS_ECDHE_RSA_WITH_ARIA_128_GCM_SHA256
+			0xc056, // TLS_DHE_DSS_WITH_ARIA_128_GCM_SHA256
+			0xc052, // TLS_DHE_RSA_WITH_ARIA_128_GCM_SHA256
+			0xc024, // TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384
+			0x006a, // TLS_DHE_DSS_WITH_AES_256_CBC_SHA256
+			0xc023, // TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256
+			0x0040, // TLS_DHE_DSS_WITH_AES_128_CBC_SHA256
+			0xc00a, // TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA
+			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+			0x0039, // TLS_DHE_RSA_WITH_AES_256_CBC_SHA
+			0x0038, // TLS_DHE_DSS_WITH_AES_256_CBC_SHA
+			0xc009, // TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+			0x0033, // TLS_DHE_RSA_WITH_AES_128_CBC_SHA
+			0x0032, // TLS_DHE_DSS_WITH_AES_128_CBC_SHA
+			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+			0xc09d, // TLS_RSA_WITH_AES_256_CCM
+			0xc051, // TLS_RSA_WITH_ARIA_256_GCM_SHA384
+			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+			0xc09c, // TLS_RSA_WITH_AES_128_CCM
+			0xc050, // TLS_RSA_WITH_ARIA_128_GCM_SHA256
+			0x003d, // TLS_RSA_WITH_AES_256_CBC_SHA256
+			0x003c, // TLS_RSA_WITH_AES_128_CBC_SHA256
+			tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+			tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+		},
+		CompressionMethods: []byte{0x00},
+		Extensions: []tls.TLSExtension{
+			// OpenSSL 3.x extension ordering: renegotiation_info first
+			&tls.RenegotiationInfoExtension{Renegotiation: tls.RenegotiateNever},
+			&tls.SNIExtension{},
+			&tls.SupportedPointsExtension{SupportedPoints: []byte{0, 1, 2}},
+			&tls.SupportedCurvesExtension{Curves: []tls.CurveID{
+				tls.X25519MLKEM768, // ML-KEM-768 post-quantum (0x11ec)
+				tls.X25519,
+				tls.CurveP256,
+				tls.CurveID(30), // X448
+				tls.CurveP384,
+				tls.CurveP521,
+				tls.CurveID(0x0100), // ffdhe2048
+				tls.CurveID(0x0101), // ffdhe3072
+			}},
+			&tls.SessionTicketExtension{},
+			&tls.GenericExtension{Id: 22}, // encrypt_then_mac
+			&tls.ExtendedMasterSecretExtension{},
+			&tls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []tls.SignatureScheme{
+				0x0905, 0x0906, 0x0904, // Unknown (not in utls dict; present in OpenSSL 3.x)
+				tls.ECDSAWithP256AndSHA256,
+				tls.ECDSAWithP384AndSHA384,
+				tls.ECDSAWithP521AndSHA512,
+				tls.Ed25519,
+				0x0808,                 // ed448
+				0x081a, 0x081b, 0x081c, // Brainpool ECDSA TLS 1.3 schemes
+				0x0809, 0x080a, 0x080b, // rsa_pss_pss_sha256/384/512
+				tls.PSSWithSHA256, // rsa_pss_rsae_sha256 (0x0804)
+				tls.PSSWithSHA384, // rsa_pss_rsae_sha384 (0x0805)
+				tls.PSSWithSHA512, // rsa_pss_rsae_sha512 (0x0806)
+				tls.PKCS1WithSHA256,
+				tls.PKCS1WithSHA384,
+				tls.PKCS1WithSHA512,
+				0x0303, // SHA224 ECDSA
+				0x0301, // SHA224 RSA
+				0x0302, // SHA224 DSA
+				0x0402, // SHA256 DSA
+				0x0502, // SHA384 DSA
+				0x0602, // SHA512 DSA
+			}},
+			&tls.SupportedVersionsExtension{Versions: []uint16{
+				tls.VersionTLS13,
+				tls.VersionTLS12,
+			}},
+			&tls.PSKKeyExchangeModesExtension{Modes: []uint8{tls.PskModeDHE}},
+			&tls.KeyShareExtension{KeyShares: []tls.KeyShare{
+				{Group: tls.X25519MLKEM768},
+				{Group: tls.X25519},
+			}},
+		},
+	}
+}
+
+// createConnection creates a new HTTP/2 connection replicating the exact TLS
+// fingerprint of Claude Code CLI (OpenSSL 3.x, 52 cipher suites, no GREASE).
 func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientConn, error) {
 	conn, err := t.dialer.Dial("tcp", addr)
 	if err != nil {
@@ -105,8 +204,12 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 	}
 
 	tlsConfig := &tls.Config{ServerName: host}
-	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
-
+	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloCustom)
+	spec := claudeCodeClientHelloSpec()
+	if err := tlsConn.ApplyPreset(&spec); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	if err := tlsConn.Handshake(); err != nil {
 		conn.Close()
 		return nil, err
@@ -118,19 +221,16 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		tlsConn.Close()
 		return nil, err
 	}
-
 	return h2Conn, nil
 }
 
-// RoundTrip implements http.RoundTripper
+// RoundTrip implements http.RoundTripper.
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Host
 	addr := host
 	if !strings.Contains(addr, ":") {
 		addr += ":443"
 	}
-
-	// Get hostname without port for TLS ServerName
 	hostname := req.URL.Hostname()
 
 	h2Conn, err := t.getOrCreateConnection(hostname, addr)
@@ -140,7 +240,6 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 
 	resp, err := h2Conn.RoundTrip(req)
 	if err != nil {
-		// Connection failed, remove it from cache
 		t.mu.Lock()
 		if cached, ok := t.connections[hostname]; ok && cached == h2Conn {
 			delete(t.connections, hostname)
@@ -148,13 +247,11 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		t.mu.Unlock()
 		return nil, err
 	}
-
 	return resp, nil
 }
 
-// NewAnthropicHttpClient creates an HTTP client that bypasses TLS fingerprinting
-// for Anthropic domains by using utls with Chrome fingerprint.
-// It accepts optional SDK configuration for proxy settings.
+// NewAnthropicHttpClient creates an HTTP client that replicates the TLS
+// fingerprint of Claude Code CLI for Anthropic API requests.
 func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
 	return &http.Client{
 		Transport: newUtlsRoundTripper(cfg),
