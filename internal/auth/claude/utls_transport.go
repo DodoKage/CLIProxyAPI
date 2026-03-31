@@ -4,6 +4,9 @@
 package claude
 
 import (
+	"bufio"
+	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -19,11 +22,15 @@ import (
 // utlsRoundTripper implements http.RoundTripper using utls to replicate the
 // exact TLS fingerprint of the Claude Code CLI (OpenSSL 3.x, 52 cipher suites,
 // no GREASE, ML-KEM-768 key share).
+//
+// Since the fingerprint has no ALPN extension (matching real Claude Code CLI),
+// servers typically respond with HTTP/1.1. The transport auto-detects the
+// negotiated protocol and uses h2 or HTTP/1.1 accordingly.
 type utlsRoundTripper struct {
-	mu          sync.Mutex
-	connections map[string]*http2.ClientConn
-	pending     map[string]*sync.Cond
-	dialer      proxy.Dialer
+	mu      sync.Mutex
+	h2Conns map[string]*http2.ClientConn
+	pending map[string]*sync.Cond
+	dialer  proxy.Dialer
 }
 
 func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
@@ -37,44 +44,10 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 		}
 	}
 	return &utlsRoundTripper{
-		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
-		dialer:      dialer,
+		h2Conns: make(map[string]*http2.ClientConn),
+		pending: make(map[string]*sync.Cond),
+		dialer:  dialer,
 	}
-}
-
-func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
-	t.mu.Lock()
-
-	if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-		t.mu.Unlock()
-		return h2Conn, nil
-	}
-
-	if cond, ok := t.pending[host]; ok {
-		cond.Wait()
-		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-			t.mu.Unlock()
-			return h2Conn, nil
-		}
-	}
-
-	cond := sync.NewCond(&t.mu)
-	t.pending[host] = cond
-	t.mu.Unlock()
-
-	h2Conn, err := t.createConnection(host, addr)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	delete(t.pending, host)
-	cond.Broadcast()
-
-	if err != nil {
-		return nil, err
-	}
-	t.connections[host] = h2Conn
-	return h2Conn, nil
 }
 
 // claudeCodeClientHelloSpec returns a ClientHelloSpec that exactly replicates
@@ -195,14 +168,12 @@ func claudeCodeClientHelloSpec() tls.ClientHelloSpec {
 	}
 }
 
-// createConnection creates a new HTTP/2 connection replicating the exact TLS
-// fingerprint of Claude Code CLI (OpenSSL 3.x, 52 cipher suites, no GREASE).
-func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientConn, error) {
+// dialTLS establishes a TLS connection with the Claude Code CLI fingerprint.
+func (t *utlsRoundTripper) dialTLS(host, addr string) (*tls.UConn, error) {
 	conn, err := t.dialer.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-
 	tlsConfig := &tls.Config{ServerName: host}
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloCustom)
 	spec := claudeCodeClientHelloSpec()
@@ -214,46 +185,79 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		conn.Close()
 		return nil, err
 	}
-
-	tr := &http2.Transport{}
-	h2Conn, err := tr.NewClientConn(tlsConn)
-	if err != nil {
-		tlsConn.Close()
-		return nil, err
-	}
-	return h2Conn, nil
+	return tlsConn, nil
 }
 
-// RoundTrip implements http.RoundTripper.
-func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	host := req.URL.Host
-	addr := host
-	if !strings.Contains(addr, ":") {
-		addr += ":443"
+// h1RoundTrip performs a single HTTP/1.1 round-trip over a pre-dialed TLS conn.
+func h1RoundTrip(conn net.Conn, req *http.Request) (*http.Response, error) {
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("writing request: %w", err)
 	}
-	hostname := req.URL.Hostname()
-
-	h2Conn, err := t.getOrCreateConnection(hostname, addr)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
 	if err != nil {
-		return nil, err
-	}
-
-	resp, err := h2Conn.RoundTrip(req)
-	if err != nil {
-		t.mu.Lock()
-		if cached, ok := t.connections[hostname]; ok && cached == h2Conn {
-			delete(t.connections, hostname)
-		}
-		t.mu.Unlock()
-		return nil, err
+		conn.Close()
+		return nil, fmt.Errorf("reading response: %w", err)
 	}
 	return resp, nil
 }
 
+// utlsH1Transport wraps utlsRoundTripper to handle protocol negotiation.
+type utlsH1Transport struct {
+	rt *utlsRoundTripper
+}
+
+func (t *utlsH1Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	host := req.URL.Hostname()
+	addr := req.URL.Host
+	if !strings.Contains(addr, ":") {
+		addr += ":443"
+	}
+
+	// Try cached h2 connection first.
+	t.rt.mu.Lock()
+	if h2Conn, ok := t.rt.h2Conns[host]; ok && h2Conn.CanTakeNewRequest() {
+		t.rt.mu.Unlock()
+		resp, err := h2Conn.RoundTrip(req)
+		if err == nil {
+			return resp, nil
+		}
+		t.rt.mu.Lock()
+		delete(t.rt.h2Conns, host)
+		t.rt.mu.Unlock()
+	} else {
+		t.rt.mu.Unlock()
+	}
+
+	tlsConn, err := t.rt.dialTLS(host, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	proto := tlsConn.ConnectionState().NegotiatedProtocol
+	if proto == "h2" {
+		tr := &http2.Transport{}
+		h2Conn, err := tr.NewClientConn(tlsConn)
+		if err != nil {
+			tlsConn.Close()
+			return nil, err
+		}
+		t.rt.mu.Lock()
+		t.rt.h2Conns[host] = h2Conn
+		t.rt.mu.Unlock()
+		return h2Conn.RoundTrip(req)
+	}
+
+	// HTTP/1.1: write request and read response over the TLS conn directly.
+	return h1RoundTrip(tlsConn, req)
+}
+
 // NewAnthropicHttpClient creates an HTTP client that replicates the TLS
 // fingerprint of Claude Code CLI for Anthropic API requests.
+// It auto-detects the negotiated protocol (h2 vs HTTP/1.1) after handshake.
 func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
+	rt := newUtlsRoundTripper(cfg)
 	return &http.Client{
-		Transport: newUtlsRoundTripper(cfg),
+		Transport: &utlsH1Transport{rt: rt},
 	}
 }
