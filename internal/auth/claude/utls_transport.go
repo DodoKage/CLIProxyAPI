@@ -6,6 +6,7 @@ package claude
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -29,7 +30,6 @@ import (
 type utlsRoundTripper struct {
 	mu      sync.Mutex
 	h2Conns map[string]*http2.ClientConn
-	pending map[string]*sync.Cond
 	dialer  proxy.Dialer
 }
 
@@ -45,7 +45,6 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	}
 	return &utlsRoundTripper{
 		h2Conns: make(map[string]*http2.ClientConn),
-		pending: make(map[string]*sync.Cond),
 		dialer:  dialer,
 	}
 }
@@ -189,6 +188,8 @@ func (t *utlsRoundTripper) dialTLS(host, addr string) (*tls.UConn, error) {
 }
 
 // h1RoundTrip performs a single HTTP/1.1 round-trip over a pre-dialed TLS conn.
+// The returned response body wraps the underlying conn so that closing the body
+// also closes the TLS connection (one-shot semantics, no keep-alive).
 func h1RoundTrip(conn net.Conn, req *http.Request) (*http.Response, error) {
 	if err := req.Write(conn); err != nil {
 		conn.Close()
@@ -199,7 +200,21 @@ func h1RoundTrip(conn net.Conn, req *http.Request) (*http.Response, error) {
 		conn.Close()
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
+	resp.Body = &connClosingBody{ReadCloser: resp.Body, conn: conn}
 	return resp, nil
+}
+
+// connClosingBody wraps a response body so that Close() also closes the
+// underlying network connection (ensures no TLS socket leak on HTTP/1.1).
+type connClosingBody struct {
+	io.ReadCloser
+	conn net.Conn
+}
+
+func (b *connClosingBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.conn.Close()
+	return err
 }
 
 // utlsH1Transport wraps utlsRoundTripper to handle protocol negotiation.
